@@ -577,8 +577,82 @@ export const config = {
 
 ## 8. API Architecture
 
-### Fetch Wrapper (config.ts)
+### Overview
+The API layer uses a centralized `fetchWithAuth` wrapper that handles authentication, timeouts, retries, and error handling for all HTTP requests.
+
+### Architecture Diagram
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         API SERVICE LAYER                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  │
+│  │ authService  │  │ documentSvc  │  │ transcriptSvc│  │ ailaDiagSvc │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬──────┘  │
+│         │                 │                 │                  │         │
+│         └─────────────────┴─────────────────┴──────────────────┘         │
+│                                    │                                     │
+│                                    ▼                                     │
+│                        ┌────────────────────┐                            │
+│                        │   fetchWithAuth    │ ◀── Central fetch wrapper  │
+│                        └─────────┬──────────┘                            │
+└──────────────────────────────────│───────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        fetchWithAuth INTERNALS                           │
+│                                                                          │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐  │
+│  │ getHeaders  │   │ Timeout     │   │ Retry Logic │   │ Error       │  │
+│  │ (Auth+CSRF) │   │ Controller  │   │ (Backoff)   │   │ Handling    │  │
+│  └─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                          ┌─────────────────┐
+                          │  Backend API    │
+                          │  (REST Server)  │
+                          └─────────────────┘
+```
+
+### Complete fetchWithAuth Implementation (config.ts)
+
+#### Step 1: Header Configuration
 ```typescript
+// Set up common headers with authorization
+export const getHeaders = (userType: 'patient' | 'doctor' = 'patient') => {
+  const token = getCookie(userType === 'patient' ? PATIENT_AUTH_COOKIE : DOCTOR_AUTH_COOKIE);
+  const csrfToken = getCookie(CSRF_TOKEN_COOKIE);
+  
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': token ? `Bearer ${token}` : '',
+    'X-CSRF-Token': csrfToken || '',
+    'X-Requested-With': 'XMLHttpRequest', // Helps protect against CSRF
+  };
+};
+```
+
+#### Step 2: Timeout Controller
+```typescript
+// Request timeout in milliseconds (150 seconds for slow connections)
+const REQUEST_TIMEOUT = 30000 * 5;
+
+// Create AbortController for request timeout
+const createTimeoutController = (ms: number = REQUEST_TIMEOUT): { 
+  controller: AbortController, 
+  timeoutId: number 
+} => {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), ms);
+  return { controller, timeoutId };
+};
+```
+
+#### Step 3: Main fetchWithAuth Function
+```typescript
+// Maximum retry attempts for failed requests
+const MAX_RETRY_ATTEMPTS = 3;
+
 export const fetchWithAuth = async (
   endpoint: string, 
   options: RequestInit = {}, 
@@ -586,48 +660,210 @@ export const fetchWithAuth = async (
   retryCount = 0
 ): Promise<unknown> => {
   
-  // Add timeout for slow connections
-  const { controller, timeoutId } = createTimeoutController(30000);
-  
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${getCookie(AUTH_COOKIE)}`,
-      'X-CSRF-Token': getCookie(CSRF_TOKEN_COOKIE) || '',
-      'X-Requested-With': 'XMLHttpRequest',  // CSRF protection
-      ...options.headers,
-    },
-    signal: controller.signal,
-  });
+  // Set up timeout - cancels request if it takes too long
+  const { controller, timeoutId } = createTimeoutController();
 
-  // Handle rate limiting with retry
-  if (response.status === 429 && retryCount < 3) {
-    const retryAfter = response.headers.get('Retry-After') || '1';
-    await new Promise(r => setTimeout(r, parseInt(retryAfter) * 1000));
-    return fetchWithAuth(endpoint, options, userType, retryCount + 1);
+  try {
+    // Make the actual fetch request
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      ...options,
+      headers: {
+        ...getHeaders(userType),  // Add auth headers
+        ...options.headers,       // Allow header overrides
+      },
+      signal: controller.signal,  // Attach timeout controller
+    });
+
+    // Clear timeout since request completed successfully
+    clearTimeout(timeoutId);
+
+    // ═══════════════════════════════════════════════════════════
+    // RATE LIMITING HANDLING (HTTP 429)
+    // ═══════════════════════════════════════════════════════════
+    if (response.status === 429 && retryCount < MAX_RETRY_ATTEMPTS) {
+      // Server says "slow down" - wait the specified time then retry
+      const retryAfter = response.headers.get('Retry-After') || '1';
+      const waitTime = parseInt(retryAfter, 10) * 1000;
+      
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      return fetchWithAuth(endpoint, options, userType, retryCount + 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ERROR RESPONSE HANDLING
+    // ═══════════════════════════════════════════════════════════
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      
+      // Authentication failure - redirect to login
+      if (response.status === 401 || response.status === 403) {
+        window.location.href = userType === 'patient' ? '/' : '/doctor-login';
+      }
+      
+      throw new Error(errorData.message || `API error: ${response.status}`);
+    }
+
+    // Parse and return JSON response
+    const responseData = await response.json();
+    return responseData;
+
+  } catch (error) {
+    // Always clear timeout on error
+    clearTimeout(timeoutId);
+    
+    // ═══════════════════════════════════════════════════════════
+    // TIMEOUT HANDLING
+    // ═══════════════════════════════════════════════════════════
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('Request timeout exceeded');
+    }
+    
+    // ═══════════════════════════════════════════════════════════
+    // NETWORK ERROR WITH EXPONENTIAL BACKOFF RETRY
+    // ═══════════════════════════════════════════════════════════
+    if (error instanceof TypeError && 
+        error.message === 'Failed to fetch' && 
+        retryCount < MAX_RETRY_ATTEMPTS) {
+      // Exponential backoff: 1s, 2s, 4s, etc.
+      const backoffTime = Math.pow(2, retryCount) * 1000;
+      await new Promise(resolve => setTimeout(resolve, backoffTime));
+      return fetchWithAuth(endpoint, options, userType, retryCount + 1);
+    }
+
+    // Re-throw unhandled errors
+    throw error;
   }
-
-  // Handle auth errors
-  if (response.status === 401 || response.status === 403) {
-    window.location.href = '/doctor-login';
-  }
-
-  return response.json();
 };
 ```
 
-### Features
-| Feature | Implementation |
-|---------|----------------|
-| Timeout | AbortController with 30s default |
-| Retry | Exponential backoff (1s, 2s, 4s) |
-| Rate Limiting | Respects Retry-After header |
-| Auth Redirect | Auto-redirect on 401/403 |
-| CSRF Protection | Token sent in headers |
+### How Each Feature Works
+
+| Feature | How It Works | Why It's Important |
+|---------|--------------|-------------------|
+| **Auto Headers** | `getHeaders()` reads auth cookies and adds them to every request | Services don't need to manually add tokens |
+| **Request Timeout** | `AbortController` cancels request after 150 seconds | Prevents UI from hanging indefinitely |
+| **Rate Limit Handling** | On 429, reads `Retry-After` header and waits | Respects server's backpressure signals |
+| **Exponential Backoff** | Network errors retry after 1s, 2s, 4s... | Gracefully handles temporary outages |
+| **Auth Redirect** | 401/403 automatically redirects to login | User doesn't see broken authenticated pages |
+| **CSRF Protection** | `X-Requested-With` + `X-CSRF-Token` headers | Prevents cross-site request forgery |
+
+### Request Flow Diagram
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                         REQUEST LIFECYCLE                               │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  START ──▶ Add Headers ──▶ Start Timer ──▶ fetch() ──────────────────┐ │
+│                                               │                       │ │
+│                                               ▼                       │ │
+│  ┌─────────────────────────────────────────────────────────────────┐ │ │
+│  │                    RESPONSE HANDLING                            │ │ │
+│  ├─────────────────────────────────────────────────────────────────┤ │ │
+│  │                                                                 │ │ │
+│  │  Status 200-299 ──▶ Return JSON ──▶ ✅ SUCCESS                  │ │ │
+│  │                                                                 │ │ │
+│  │  Status 401/403 ──▶ Redirect to Login ──▶ 🔐 AUTH REQUIRED      │ │ │
+│  │                                                                 │ │ │
+│  │  Status 429 ──▶ Wait (Retry-After) ──▶ 🔄 RETRY (up to 3x)      │ │ │
+│  │                                                                 │ │ │
+│  │  Status 4xx/5xx ──▶ Throw Error ──▶ ❌ FAIL                     │ │ │
+│  │                                                                 │ │ │
+│  └─────────────────────────────────────────────────────────────────┘ │ │
+│                                                                       │ │
+│  ┌─────────────────────────────────────────────────────────────────┐ │ │
+│  │                     ERROR HANDLING                              │ │ │
+│  ├─────────────────────────────────────────────────────────────────┤ │ │
+│  │                                                                 │ │ │
+│  │  AbortError (timeout) ──▶ Throw "timeout exceeded"              │ │ │
+│  │                                                                 │ │ │
+│  │  Network Error ──▶ Backoff ──▶ 🔄 RETRY (1s, 2s, 4s...)         │ │ │
+│  │                                                                 │ │ │
+│  │  Other Error ──▶ Re-throw ──▶ ❌ FAIL                           │ │ │
+│  │                                                                 │ │ │
+│  └─────────────────────────────────────────────────────────────────┘ │ │
+│                                                                       │ │
+└───────────────────────────────────────────────────────────────────────┘ │
+                                                                          │
+    ◀──────────────────────────────────────────────────────────────────────┘
+```
+
+### Usage Examples
+
+```typescript
+// Simple GET request
+const templates = await fetchWithAuth('/api/documents/templates', {}, 'doctor');
+
+// POST with body
+const result = await fetchWithAuth('/api/auth/login', {
+  method: 'POST',
+  body: JSON.stringify({ email, password }),
+}, 'doctor');
+
+// With custom headers
+const response = await fetchWithAuth('/api/custom', {
+  method: 'POST',
+  headers: { 'X-Custom-Header': 'value' },
+  body: JSON.stringify(data),
+}, 'patient');
+```
+
+### Enhanced Variant: fetchWithSanitization
+
+For POST/PUT requests with user input, there's a sanitized version:
+
+```typescript
+export const fetchWithSanitization = async (
+  endpoint: string,
+  method: 'POST' | 'PUT',
+  body: object,
+  userType: 'patient' | 'doctor' = 'patient'
+) => {
+  // Sanitize all string values to prevent XSS
+  const sanitizeObject = (obj: unknown): unknown => {
+    if (typeof obj === 'string') {
+      // HTML-encode the string
+      const div = document.createElement('div');
+      div.textContent = obj;
+      return div.innerHTML;
+    }
+    if (Array.isArray(obj)) {
+      return obj.map(item => sanitizeObject(item));
+    }
+    if (typeof obj === 'object' && obj !== null) {
+      const sanitized: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(obj)) {
+        sanitized[key] = sanitizeObject(value);
+      }
+      return sanitized;
+    }
+    return obj;
+  };
+  
+  const sanitizedBody = sanitizeObject(body);
+  return fetchWithAuth(endpoint, {
+    method,
+    body: JSON.stringify(sanitizedBody),
+  }, userType);
+};
+```
 
 ### What to Explain in Interview
-> "All API calls go through a centralized `fetchWithAuth` wrapper that handles common concerns. It automatically adds authentication headers from cookies, implements request timeouts to prevent hanging, and includes retry logic with exponential backoff for transient failures. If the backend returns a 401 or 403, it redirects to the login page. This means individual API services don't need to worry about these cross-cutting concerns."
+
+> "All API calls go through a centralized `fetchWithAuth` wrapper that handles cross-cutting concerns:
+
+> **1. Authentication:** It automatically reads the auth token from cookies and adds it to every request header. This means individual API services don't need to know about authentication.
+
+> **2. Timeouts:** I use an `AbortController` with a 150-second timeout. If the backend doesn't respond, the request is cancelled and an error is thrown. This prevents the UI from appearing frozen.
+
+> **3. Automatic Retries:** For network failures like 'Failed to fetch', it retries with exponential backoff - first wait 1 second, then 2, then 4. This handles temporary network issues gracefully.
+
+> **4. Rate Limiting:** If the server returns a 429 'Too Many Requests', it reads the `Retry-After` header and waits that long before retrying. This respects the server's backpressure.
+
+> **5. Security:** Every request includes a CSRF token and the `X-Requested-With` header. This protects against cross-site request forgery attacks.
+
+> **6. Auth Failures:** If the backend returns 401 or 403, it automatically redirects to the login page. The user never sees a broken authenticated page.
+
+> The benefit is that services like `authService.ts` or `documentService.ts` just call `fetchWithAuth('/api/endpoint', options)` and all this behavior happens automatically."
 
 ---
 
